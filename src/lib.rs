@@ -47,76 +47,19 @@ pub trait KeysBlock: Copy {
     fn insert(&mut self, key: Self::Key) -> usize;
 }
 
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "powerpc64",
-))]
-const CL_SIZE: usize = 128;
-
-#[cfg(any(
-    target_arch = "arm",
-    target_arch = "mips",
-    target_arch = "mips64",
-    target_arch = "riscv64",
-))]
-const CL_SIZE: usize = 32;
-
-#[cfg(target_arch = "s390x")]
-const CL_SIZE: usize = 256;
-
-#[cfg(not(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "powerpc64",
-    target_arch = "arm",
-    target_arch = "mips",
-    target_arch = "mips64",
-    target_arch = "riscv64",
-    target_arch = "s390x",
-)))]
-const CL_SIZE: usize = 64;
-
 /// Struct representing a block of keys where we use u32::MAX as flag for empty slots.
 #[derive(Copy, Clone)]
-#[cfg_attr(
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64",
-    ),
-    repr(align(128))
-)]
-#[cfg_attr(
-    any(
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mips64",
-        target_arch = "riscv64",
-    ),
-    repr(align(32))
-)]
-#[cfg_attr(
-    not(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64",
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mips64",
-        target_arch = "riscv64",
-        target_arch = "s390x",
-    )),
-    repr(align(64))
-)]
+#[cfg_attr(target_arch = "x86_64", repr(align(128)))]
 pub struct U32KeysBlock {
     keys: [u32; Self::TOTAL_KEYS],
 }
 
 impl U32KeysBlock {
+    /// For this case we use the mask with all bits set as en empty value since we can.
     const FREE_KEY: u32 = u32::MAX;
 
-    const TOTAL_KEYS: usize = CL_SIZE / std::mem::size_of::<u32>();
+    /// The number of keys fits perfectly in two cache lines for x86_64 architecture.
+    const TOTAL_KEYS: usize = 32;
 }
 
 impl KeysBlock for U32KeysBlock {
@@ -170,6 +113,11 @@ impl KeysBlock for U32KeysBlock {
         }
         unreachable!("the block has space so we must be able to insert");
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TryInsertError {
+    OutOfSpace,
 }
 
 pub struct FastMap<B: KeysBlock, V: Copy> {
@@ -306,21 +254,23 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
     }
 
     /// Directly insert the key and index couple in the map without checking if we need to resize.
-    /// Panics in debug if the new entry can not be inserted.
+    /// # Safety
+    /// This function assumes that you know there is enough space to do the insertion.
+    /// Panics in debug if that's not the case.
     pub unsafe fn insert_direct(&mut self, key: B::Key, value: V) {
         self.insert_internal(key, value);
     }
 
     /// Try to insert a new element without resizing the map. Returns Ok if the element can be inserted,
     /// Err if we are out of space.
-    pub fn try_insert(&mut self, key: B::Key, value: V) -> Result<(), ()> {
+    pub fn try_insert(&mut self, key: B::Key, value: V) -> Result<(), TryInsertError> {
         // Check if we are out of space on the map to insert further indices
         if self.capacity() > self.len() {
             // SAFETY: We just checked there is enough space
             unsafe { self.insert_direct(key, value) };
             Ok(())
         } else {
-            Err(())
+            Err(TryInsertError::OutOfSpace)
         }
     }
 
@@ -365,7 +315,7 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
 
     /// Search for element in the map, returns None if the key is not present.
     #[inline]
-    pub fn get(&self, key: B::Key) -> Option<V> {
+    pub fn get(&self, key: B::Key) -> Option<&V> {
         if self.is_empty() {
             None
         } else {
@@ -384,7 +334,7 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
                                 as usize
                                 * B::KEYS_PER_BLOCK
                                 + block_offset;
-                            return Some(self.values.add(values_offset).read());
+                            return Some(&*self.values.add(values_offset));
                         }
                         KeysBlockLookup::NotFoundStop => return None,
                         KeysBlockLookup::NotFoundContinue => (),
@@ -394,6 +344,39 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
                     if candidate_block_ptr == keys_block_end {
                         candidate_block_ptr = self.keys_blocks;
                     }
+                }
+            }
+        }
+    }
+
+    /// Get reference to the value for the given key assuming it exists.
+    /// # Safety
+    /// The function assumes the key will be found in the map, it's UB to use it with a key that is
+    /// not in the map.
+    pub unsafe fn get_existing(&self, key: B::Key) -> &V {
+        unsafe {
+            let keys_block_end = self.keys_blocks.add(self.allocated_blocks);
+
+            let mut candidate_block_ptr = self.keys_blocks.add(self.compute_key_block_index(key));
+
+            loop {
+                let candidate_block = &*candidate_block_ptr;
+
+                match candidate_block.contains(key) {
+                    KeysBlockLookup::Found(block_offset) => {
+                        let values_offset = candidate_block_ptr.offset_from(self.keys_blocks)
+                            as usize
+                            * B::KEYS_PER_BLOCK
+                            + block_offset;
+                        return &*self.values.add(values_offset);
+                    }
+                    KeysBlockLookup::NotFoundStop => std::hint::unreachable_unchecked(),
+                    KeysBlockLookup::NotFoundContinue => (),
+                }
+
+                candidate_block_ptr = candidate_block_ptr.add(1);
+                if candidate_block_ptr == keys_block_end {
+                    candidate_block_ptr = self.keys_blocks;
                 }
             }
         }
@@ -434,7 +417,8 @@ mod tests {
         assert_eq!(map.max_in_use_elements, 108);
 
         for i in 0..100 {
-            assert_eq!(map.get(i).unwrap(), i);
+            assert_eq!(*map.get(i).unwrap(), i);
+            assert_eq!(unsafe { *map.get_existing(i) }, i);
         }
         for i in 100..1000 {
             assert!(map.get(i).is_none());
