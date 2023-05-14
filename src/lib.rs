@@ -34,17 +34,8 @@ pub trait KeysBlock: Copy {
     /// Check if the block contains the given key.
     fn contains(&self, key: Self::Key) -> KeysBlockLookup;
 
-    /// Check if the block has space.
-    #[inline]
-    fn has_space(&self) -> bool {
-        !self.full()
-    }
-
-    /// Check if the block is full.
-    fn full(&self) -> bool;
-
-    /// Insert the given key in the block assuming there is space.
-    fn insert(&mut self, key: Self::Key) -> usize;
+    /// Try to insert the given key in the block, returns the offset if successful.
+    fn try_insert(&mut self, key: Self::Key) -> Option<usize>;
 }
 
 /// Struct representing a block of keys where we use u32::MAX as flag for empty slots.
@@ -60,6 +51,29 @@ impl U32KeysBlock {
 
     /// The number of keys fits perfectly in two cache lines for x86_64 architecture.
     const TOTAL_KEYS: usize = 32;
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn simd_chunk(&self, chunk: usize) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::{_mm256_castps_si256, _mm256_load_ps};
+        _mm256_castps_si256(_mm256_load_ps(
+            self.keys.as_ptr().add(8 * chunk) as *const f32
+        ))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn chunk_empty_mask(&self, chunk: usize) -> u32 {
+        use std::arch::x86_64::{
+            _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_movemask_ps, _mm256_set1_epi32,
+        };
+
+        let empty_key_splat = _mm256_set1_epi32(Self::FREE_KEY as i32);
+        let has_empty = _mm256_cmpeq_epi32(self.simd_chunk(chunk), empty_key_splat);
+        let has_empty_mask = _mm256_movemask_ps(_mm256_castsi256_ps(has_empty));
+        debug_assert!(has_empty_mask <= u8::MAX as i32);
+        (has_empty_mask as u32) << (8 * chunk)
+    }
 }
 
 impl KeysBlock for U32KeysBlock {
@@ -85,33 +99,83 @@ impl KeysBlock for U32KeysBlock {
     fn contains(&self, key: Self::Key) -> KeysBlockLookup {
         debug_assert_ne!(key, Self::FREE_KEY);
 
-        for offset in 0..Self::TOTAL_KEYS {
-            let offset_key = self.keys[offset];
-            if offset_key == Self::FREE_KEY {
-                return KeysBlockLookup::NotFoundStop;
-            } else if offset_key == key {
-                return KeysBlockLookup::Found(offset);
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{
+                _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_movemask_ps, _mm256_set1_epi32,
+            };
+
+            let key_splat = _mm256_set1_epi32(key as i32);
+
+            let chunk_masks = |chunk: usize| -> (u32, u32) {
+                let has_key = _mm256_cmpeq_epi32(key_splat, self.simd_chunk(chunk));
+                let has_key_mask = _mm256_movemask_ps(_mm256_castsi256_ps(has_key)) as u32;
+                debug_assert!(has_key_mask <= 1 << 7);
+                debug_assert!(has_key_mask == 0 || has_key_mask.is_power_of_two());
+                (self.chunk_empty_mask(chunk), has_key_mask << (8 * chunk))
+            };
+
+            let c0_masks = chunk_masks(0);
+            let c1_masks = chunk_masks(1);
+            let c2_masks = chunk_masks(2);
+            let c3_masks = chunk_masks(3);
+
+            let has_empty_mask = c0_masks.0 | c1_masks.0 | c2_masks.0 | c3_masks.0;
+            let has_key_mask = c0_masks.1 | c1_masks.1 | c2_masks.1 | c3_masks.1;
+
+            if has_key_mask != 0 {
+                KeysBlockLookup::Found(has_key_mask.trailing_zeros() as usize)
+            } else if has_empty_mask == 0 {
+                KeysBlockLookup::NotFoundContinue
+            } else {
+                KeysBlockLookup::NotFoundStop
             }
         }
 
-        KeysBlockLookup::NotFoundContinue
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for offset in 0..Self::TOTAL_KEYS {
+                let offset_key = self.keys[offset];
+                if offset_key == Self::FREE_KEY {
+                    return KeysBlockLookup::NotFoundStop;
+                } else if offset_key == key {
+                    return KeysBlockLookup::Found(offset);
+                }
+            }
+
+            KeysBlockLookup::NotFoundContinue
+        }
     }
 
     #[inline]
-    fn full(&self) -> bool {
-        self.keys.iter().all(|&key| key != Self::FREE_KEY)
-    }
+    fn try_insert(&mut self, key: Self::Key) -> Option<usize> {
+        debug_assert_ne!(key, Self::FREE_KEY);
+        debug_assert!(self.keys.iter().all(|&k| k != key));
 
-    #[inline]
-    fn insert(&mut self, key: Self::Key) -> usize {
-        debug_assert!(self.has_space());
-        for i in 0..Self::TOTAL_KEYS {
-            if self.keys[i] == Self::FREE_KEY {
-                self.keys[i] = key;
-                return i;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let empty_slot_mask = unsafe {
+                self.chunk_empty_mask(0)
+                    | self.chunk_empty_mask(1)
+                    | self.chunk_empty_mask(2)
+                    | self.chunk_empty_mask(3)
+            };
+
+            // Check if there are no empty slots
+            if empty_slot_mask == 0 {
+                None
+            } else {
+                let offset = empty_slot_mask.trailing_zeros() as usize;
+                debug_assert_eq!(self.keys[offset], Self::FREE_KEY);
+                self.keys[offset] = key;
+                Some(offset)
             }
         }
-        unreachable!("the block has space so we must be able to insert");
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            todo!()
+        }
     }
 }
 
@@ -230,24 +294,24 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
                 let candidate_block = &mut *candidate_block_ptr;
 
                 // Check if we can insert in the block
-                if candidate_block.has_space() {
-                    // Insert the key in the block and get the offset
-                    let block_offset = candidate_block.insert(key);
-                    // Now we also write the value at the corresponding index
-                    let values_offset = candidate_block_ptr.offset_from(self.keys_blocks) as usize
-                        * B::KEYS_PER_BLOCK
-                        + block_offset;
-                    self.values.add(values_offset).write(value);
-                    // Increment the number of elements in the map
-                    self.in_use_elements += 1;
-                    // We have inserted the pair, we can exit
-                    break;
-                }
-
-                // Go to the next element, wrapping at the end of the buffer
-                candidate_block_ptr = candidate_block_ptr.add(1);
-                if candidate_block_ptr == keys_blocks_end {
-                    candidate_block_ptr = self.keys_blocks;
+                match candidate_block.try_insert(key) {
+                    Some(block_offset) => {
+                        // Compute the offset where we should insert the value
+                        let values_offset = candidate_block_ptr.offset_from(self.keys_blocks)
+                            as usize
+                            * B::KEYS_PER_BLOCK
+                            + block_offset;
+                        self.values.add(values_offset).write(value);
+                        self.in_use_elements += 1;
+                        break;
+                    }
+                    None => {
+                        // Go to the next element, wrapping at the end of the buffer
+                        candidate_block_ptr = candidate_block_ptr.add(1);
+                        if candidate_block_ptr == keys_blocks_end {
+                            candidate_block_ptr = self.keys_blocks;
+                        }
+                    }
                 }
             }
         }
@@ -407,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_creation() {
-        let mut map = FastMap::<U32KeysBlock, u32>::with_capacity(100);
+        let mut map = FastMap::<U32Single, u32>::with_capacity(100);
 
         for i in 0..100 {
             map.try_insert(i, i).unwrap();
