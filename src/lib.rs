@@ -33,25 +33,25 @@ pub trait KeysBlock: Copy {
 
 #[derive(Copy, Clone, Default)]
 #[repr(transparent)]
-struct KeysMask {
+struct KeysMask<const IN_USE_BITS: u32> {
     mask: u32,
 }
 
-impl KeysMask {
+impl<const IN_USE_BITS: u32> KeysMask<IN_USE_BITS> {
     const EMPTY: Self = Self { mask: 0 };
 
     /// Set the bit for the given index to 1.
     #[inline(always)]
     fn set_in_use(&mut self, index: u32) {
         debug_assert_eq!((self.mask >> index) & 1, 0);
-        debug_assert!(index < u32::BITS - 1);
+        debug_assert!(index < IN_USE_BITS);
         self.mask |= 1 << index;
     }
 
     /// Check if the chunk is full.
     #[inline(always)]
     fn is_full(self) -> bool {
-        self.mask == (u32::MAX >> 1)
+        self.mask == (1 << IN_USE_BITS) - 1
     }
 
     /// Check if there is still space in the chunk.
@@ -65,7 +65,7 @@ impl KeysMask {
 #[derive(Copy, Clone)]
 #[cfg_attr(target_arch = "x86_64", repr(align(128), C))]
 pub struct U32KeysBlock {
-    keys_mask: KeysMask,
+    keys_mask: KeysMask<31>,
     keys: [u32; Self::TOTAL_KEYS],
 }
 
@@ -198,11 +198,13 @@ impl KeysBlock for U32KeysBlock {
     }
 }
 
+/// Enum with the only error that can happen when you try to insert and the map is full.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TryInsertError {
     OutOfSpace,
 }
 
+/// A very fast hashmap designed specifically for some use cases.
 pub struct FastMap<B: KeysBlock, V: Copy> {
     buffer: NonNull<u8>,
     keys_blocks: *mut B,
