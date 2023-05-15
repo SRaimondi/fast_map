@@ -46,6 +46,23 @@ fn insert_in_keys<T: Copy + Eq + std::fmt::Debug, const N: usize>(
     None
 }
 
+#[inline(always)]
+fn insert_with_mask<const IN_USE_BITS: usize, T: Copy>(
+    keys_mask: &mut KeysMask<IN_USE_BITS>,
+    keys: &mut [T; IN_USE_BITS],
+    key: T,
+) -> Option<usize> {
+    if keys_mask.is_full() {
+        None
+    } else {
+        let free_slot_index = keys_mask.free_slot_index();
+
+        keys_mask.set_in_use(free_slot_index);
+        unsafe { *keys.get_unchecked_mut(free_slot_index as usize) = key };
+        Some(free_slot_index as usize)
+    }
+}
+
 /// Trait exposing the methods a block of key should have.
 pub trait KeysBlock: Copy {
     /// Type of the key
@@ -70,11 +87,11 @@ pub trait KeysBlock: Copy {
 /// Helper struct representing a bitset that we use to indicate what keys are used and what not.
 #[derive(Copy, Clone, Default)]
 #[repr(transparent)]
-struct KeysMask<const IN_USE_BITS: u32> {
+struct KeysMask<const IN_USE_BITS: usize> {
     mask: u32,
 }
 
-impl<const IN_USE_BITS: u32> KeysMask<IN_USE_BITS> {
+impl<const IN_USE_BITS: usize> KeysMask<IN_USE_BITS> {
     /// Constant representing no key is used.
     const EMPTY: Self = Self { mask: 0 };
 
@@ -82,7 +99,7 @@ impl<const IN_USE_BITS: u32> KeysMask<IN_USE_BITS> {
     #[inline(always)]
     fn set_in_use(&mut self, index: u32) {
         debug_assert_eq!((self.mask >> index) & 1, 0);
-        debug_assert!(index < IN_USE_BITS);
+        debug_assert!(index < IN_USE_BITS as u32);
         self.mask |= 1 << index;
     }
 
@@ -183,16 +200,7 @@ impl KeysBlock for U32KeysBlock {
 
     #[inline(always)]
     fn try_insert(&mut self, key: Self::Key) -> Option<usize> {
-        if self.keys_mask.is_full() {
-            None
-        } else {
-            let free_slot_index = self.keys_mask.free_slot_index();
-
-            self.keys_mask.set_in_use(free_slot_index);
-            self.keys[free_slot_index as usize] = key;
-
-            Some(free_slot_index as usize)
-        }
+        insert_with_mask(&mut self.keys_mask, &mut self.keys, key)
     }
 }
 
@@ -268,18 +276,7 @@ impl KeysBlock for U64KeysBlock {
 
     #[inline(always)]
     fn try_insert(&mut self, key: Self::Key) -> Option<usize> {
-        debug_assert!(self.keys.iter().all(|&k| k != key));
-
-        if self.keys_mask.is_full() {
-            None
-        } else {
-            let free_slot_index = self.keys_mask.free_slot_index();
-
-            self.keys_mask.set_in_use(free_slot_index);
-            self.keys[free_slot_index as usize] = key;
-
-            Some(free_slot_index as usize)
-        }
+        insert_with_mask(&mut self.keys_mask, &mut self.keys, key)
     }
 }
 
