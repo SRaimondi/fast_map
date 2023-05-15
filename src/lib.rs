@@ -40,17 +40,21 @@ struct KeysMask {
 impl KeysMask {
     const EMPTY: Self = Self { mask: 0 };
 
+    /// Set the bit for the given index to 1.
     #[inline(always)]
     fn set_in_use(&mut self, index: u32) {
-        debug_assert!(index < u32::BITS);
+        debug_assert_eq!((self.mask >> index) & 1, 0);
+        debug_assert!(index < u32::BITS - 1);
         self.mask |= 1 << index;
     }
 
+    /// Check if the chunk is full.
     #[inline(always)]
     fn is_full(self) -> bool {
         self.mask == (u32::MAX >> 1)
     }
 
+    /// Check if there is still space in the chunk.
     #[inline(always)]
     fn has_space(self) -> bool {
         !self.is_full()
@@ -91,14 +95,10 @@ impl KeysBlock for U32KeysBlock {
         keys: [Self::FREE_KEY; Self::TOTAL_KEYS],
     };
 
-    #[inline]
+    #[inline(always)]
     fn hash(key: Self::Key) -> usize {
-        let mut h = key ^ (key >> 16);
-        h = h.wrapping_mul(0x85EBCA6B);
-        h ^= h >> 13;
-        h = h.wrapping_mul(0xC2B2AE35);
-        h ^= h >> 16;
-        h as usize
+        // This is quite "simple" but the benchmark tells that this is working very well
+        key as usize
     }
 
     #[inline]
@@ -134,7 +134,15 @@ impl KeysBlock for U32KeysBlock {
 
         #[cfg(not(target_arch = "x86_64"))]
         {
-            todo!()
+            for i in 0..self.keys.len() {
+                let k = self.keys[i];
+                debug_assert_ne!(k, Self::FREE_KEY);
+                if k == key {
+                    return Some(i);
+                }
+            }
+
+            None
         }
     }
 
@@ -178,7 +186,14 @@ impl KeysBlock for U32KeysBlock {
 
         #[cfg(not(target_arch = "x86_64"))]
         {
-            todo!()
+            for i in 0..self.keys.len() {
+                if self.keys[i] == Self::FREE_KEY {
+                    self.keys[i] = key;
+                    return Some(i);
+                }
+            }
+
+            None
         }
     }
 }
