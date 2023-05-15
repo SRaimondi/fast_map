@@ -5,13 +5,11 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dependencies]
-rand_pcg = "*"
-rand = "*"
-
 [dev-dependencies]
 metrohash = "*"
 criterion = { version = "*", features = ["html_reports"] }
+rand_pcg = "*"
+rand = "*"
 
 [profile.bench]
 # debug = true

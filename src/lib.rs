@@ -1,13 +1,49 @@
 use std::{
     alloc::{self, Layout},
-    num::NonZeroU32,
+    num::{NonZeroU16, NonZeroU32},
     ptr::{self, NonNull},
     slice,
 };
 
+#[inline]
 fn round_up(a: usize, b: usize) -> usize {
     assert_ne!(b, 0);
     (a + b - 1) / b
+}
+
+#[inline]
+#[cfg(not(target_arch = "x86_64"))]
+fn find_in_keys<T: Copy + Eq + std::fmt::Debug, const N: usize>(
+    keys: &[T; N],
+    key: T,
+    free_key: T,
+) -> Option<usize> {
+    for i in 0..N {
+        let k = keys[i];
+        debug_assert_ne!(k, free_key);
+        if k == key {
+            return Some(i);
+        }
+    }
+
+    None
+}
+
+#[inline]
+#[cfg(not(target_arch = "x86_64"))]
+fn insert_in_keys<T: Copy + Eq + std::fmt::Debug, const N: usize>(
+    keys: &mut [T; N],
+    key: T,
+    free_key: T,
+) -> Option<usize> {
+    for i in 0..N {
+        if keys[i] == free_key {
+            keys[i] = key;
+            return Some(i);
+        }
+    }
+
+    None
 }
 
 /// Trait exposing the methods a block of key should have.
@@ -31,6 +67,7 @@ pub trait KeysBlock: Copy {
     fn try_insert(&mut self, key: Self::Key) -> Option<usize>;
 }
 
+/// Helper struct representing a bitset that we use to indicate what keys are used and what not.
 #[derive(Copy, Clone, Default)]
 #[repr(transparent)]
 struct KeysMask<const IN_USE_BITS: u32> {
@@ -38,6 +75,7 @@ struct KeysMask<const IN_USE_BITS: u32> {
 }
 
 impl<const IN_USE_BITS: u32> KeysMask<IN_USE_BITS> {
+    /// Constant representing no key is used.
     const EMPTY: Self = Self { mask: 0 };
 
     /// Set the bit for the given index to 1.
@@ -52,6 +90,13 @@ impl<const IN_USE_BITS: u32> KeysMask<IN_USE_BITS> {
     #[inline(always)]
     fn is_full(self) -> bool {
         self.mask == (1 << IN_USE_BITS) - 1
+    }
+
+    /// Get the index where there is an emtpy key.
+    #[inline(always)]
+    fn free_slot_index(self) -> u32 {
+        debug_assert!(self.has_space());
+        self.mask.trailing_ones()
     }
 
     /// Check if there is still space in the chunk.
@@ -70,9 +115,6 @@ pub struct U32KeysBlock {
 }
 
 impl U32KeysBlock {
-    /// For this case we use the mask with all bits set as en empty value since we can.
-    const FREE_KEY: u32 = u32::MAX;
-
     /// The number of keys fits perfectly in two cache lines for x86_64 architecture.
     const TOTAL_KEYS: usize = 31;
 
@@ -92,7 +134,7 @@ impl KeysBlock for U32KeysBlock {
 
     const EMPTY: Self = Self {
         keys_mask: KeysMask::EMPTY,
-        keys: [Self::FREE_KEY; Self::TOTAL_KEYS],
+        keys: [0; Self::TOTAL_KEYS],
     };
 
     #[inline(always)]
@@ -101,9 +143,8 @@ impl KeysBlock for U32KeysBlock {
         key as usize
     }
 
-    #[inline]
+    #[inline(always)]
     fn get(&self, key: Self::Key) -> Option<usize> {
-        debug_assert_ne!(key, Self::FREE_KEY);
         debug_assert!(!self.keys_mask.has_space() || self.keys.iter().any(|&k| k == key));
 
         #[cfg(target_arch = "x86_64")]
@@ -117,9 +158,96 @@ impl KeysBlock for U32KeysBlock {
             let chunk_has_key_mask = |chunk: usize| -> u32 {
                 let has_key = _mm256_cmpeq_epi32(key_splat, self.simd_chunk(chunk));
                 let has_key_mask = _mm256_movemask_ps(_mm256_castsi256_ps(has_key)) as u32;
-                debug_assert!(has_key_mask <= 1 << 7);
-                debug_assert!(has_key_mask == 0 || has_key_mask.is_power_of_two());
                 has_key_mask << (8 * chunk)
+            };
+
+            // First we compose the mask by putting in a u32 all the bits
+            let mut has_key_mask = chunk_has_key_mask(0)
+                | chunk_has_key_mask(1)
+                | chunk_has_key_mask(2)
+                | chunk_has_key_mask(3);
+            // Next we shift right by one since the first element is the mask
+            has_key_mask >>= 1;
+            // Finally we & each bit with the mask of the keys in use to avoid taking into account wrong elements
+            has_key_mask &= self.keys_mask.mask;
+
+            (has_key_mask != 0)
+                .then_some(NonZeroU32::new_unchecked(has_key_mask).trailing_zeros() as usize)
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            find_in_keys(&self.keys, key, Self::FREE_KEY)
+        }
+    }
+
+    #[inline(always)]
+    fn try_insert(&mut self, key: Self::Key) -> Option<usize> {
+        if self.keys_mask.is_full() {
+            None
+        } else {
+            let free_slot_index = self.keys_mask.free_slot_index();
+
+            self.keys_mask.set_in_use(free_slot_index);
+            self.keys[free_slot_index as usize] = key;
+
+            Some(free_slot_index as usize)
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+#[cfg_attr(target_arch = "x86_64", repr(align(128), C))]
+pub struct U64KeysBlock {
+    keys_mask: KeysMask<15>,
+    _padding: u32,
+    keys: [u64; Self::TOTAL_KEYS],
+}
+
+impl U64KeysBlock {
+    const TOTAL_KEYS: usize = 15;
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn simd_chunk(&self, chunk: usize) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::{_mm256_castpd_si256, _mm256_load_pd};
+        let ptr: *const u32 = &self.keys_mask.mask;
+        _mm256_castpd_si256(_mm256_load_pd((ptr as *const f64).add(4 * chunk)))
+    }
+}
+
+impl KeysBlock for U64KeysBlock {
+    type Key = u64;
+
+    const KEYS_PER_BLOCK: usize = Self::TOTAL_KEYS;
+
+    const EMPTY: Self = Self {
+        keys_mask: KeysMask::EMPTY,
+        _padding: 0,
+        keys: [0; Self::TOTAL_KEYS],
+    };
+
+    #[inline(always)]
+    fn hash(key: Self::Key) -> usize {
+        key as usize
+    }
+
+    #[inline(always)]
+    fn get(&self, key: Self::Key) -> Option<usize> {
+        debug_assert!(!self.keys_mask.has_space() || self.keys.iter().any(|&k| k == key));
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{
+                _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_movemask_pd, _mm256_set1_epi64x,
+            };
+
+            let key_splat = _mm256_set1_epi64x(key as i64);
+
+            let chunk_has_key_mask = |chunk: usize| -> u16 {
+                let has_key = _mm256_cmpeq_epi64(key_splat, self.simd_chunk(chunk));
+                let has_key_mask = _mm256_movemask_pd(_mm256_castsi256_pd(has_key)) as u16;
+                has_key_mask << (4 * chunk)
             };
 
             let has_key_mask = (chunk_has_key_mask(0)
@@ -129,71 +257,28 @@ impl KeysBlock for U32KeysBlock {
                 >> 1;
 
             (has_key_mask != 0)
-                .then_some(NonZeroU32::new_unchecked(has_key_mask).trailing_zeros() as usize)
+                .then_some(NonZeroU16::new_unchecked(has_key_mask).trailing_zeros() as usize)
         }
 
         #[cfg(not(target_arch = "x86_64"))]
         {
-            for i in 0..self.keys.len() {
-                let k = self.keys[i];
-                debug_assert_ne!(k, Self::FREE_KEY);
-                if k == key {
-                    return Some(i);
-                }
-            }
-
-            None
+            find_in_keys(&self.keys, key, Self::FREE_KEY)
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn try_insert(&mut self, key: Self::Key) -> Option<usize> {
-        debug_assert_ne!(key, Self::FREE_KEY);
         debug_assert!(self.keys.iter().all(|&k| k != key));
 
         if self.keys_mask.is_full() {
-            return None;
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{
-                _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_movemask_ps, _mm256_set1_epi32,
-            };
-
-            let chunk_has_empty_mask = |chunk: usize| -> u32 {
-                let empty_key_splat = _mm256_set1_epi32(Self::FREE_KEY as i32);
-                let has_empty = _mm256_cmpeq_epi32(self.simd_chunk(chunk), empty_key_splat);
-                let has_empty_mask = _mm256_movemask_ps(_mm256_castsi256_ps(has_empty));
-                debug_assert!(has_empty_mask <= u8::MAX as i32);
-                (has_empty_mask as u32) << (8 * chunk)
-            };
-
-            let empty_slot_mask = (chunk_has_empty_mask(0)
-                | chunk_has_empty_mask(1)
-                | chunk_has_empty_mask(2)
-                | chunk_has_empty_mask(3))
-                >> 1;
-
-            let offset = NonZeroU32::new_unchecked(empty_slot_mask).trailing_zeros();
-            debug_assert_eq!(self.keys[offset as usize], Self::FREE_KEY);
-
-            self.keys_mask.set_in_use(offset);
-            self.keys[offset as usize] = key;
-
-            Some(offset as usize)
-        }
-
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            for i in 0..self.keys.len() {
-                if self.keys[i] == Self::FREE_KEY {
-                    self.keys[i] = key;
-                    return Some(i);
-                }
-            }
-
             None
+        } else {
+            let free_slot_index = self.keys_mask.free_slot_index();
+
+            self.keys_mask.set_in_use(free_slot_index);
+            self.keys[free_slot_index as usize] = key;
+
+            Some(free_slot_index as usize)
         }
     }
 }
@@ -219,11 +304,13 @@ pub struct FastMap<B: KeysBlock, V: Copy> {
 
 impl<B: KeysBlock, V: Copy> Drop for FastMap<B, V> {
     fn drop(&mut self) {
-        unsafe {
-            alloc::dealloc(
-                self.buffer.as_ptr(),
-                Self::buffer_layout(self.allocated_blocks).0,
-            )
+        if self.allocated_blocks != 0 {
+            unsafe {
+                alloc::dealloc(
+                    self.buffer.as_ptr(),
+                    Self::buffer_layout(self.allocated_blocks).0,
+                )
+            }
         }
     }
 }
@@ -450,18 +537,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_creation() {
-        let mut map = FastMap::<U32KeysBlock, u32>::with_capacity(100);
+    fn test_creation_u32() {
+        for capacity in 0..(1 << 12) {
+            let mut map = FastMap::<U32KeysBlock, u32>::with_capacity(capacity);
+            for i in 0..capacity {
+                map.try_insert(i as u32, i as u32).unwrap();
+            }
+            assert_eq!(map.len(), capacity);
+            assert!(map.len() <= map.capacity());
 
-        for i in 0..100 {
-            map.try_insert(i, i).unwrap();
+            for i in 0..capacity {
+                assert_eq!(unsafe { *map.get_existing(i as u32) }, i as u32);
+            }
         }
+    }
 
-        assert_eq!(map.len(), 100);
-        assert_eq!(map.max_in_use_elements, 105);
+    #[test]
+    fn test_creation_u64() {
+        for capacity in 0..(1 << 12) {
+            let mut map = FastMap::<U64KeysBlock, u32>::with_capacity(capacity);
+            for i in 0..capacity {
+                map.try_insert((i + 1) as u64, i as u32).unwrap();
+            }
+            assert_eq!(map.len(), capacity);
+            assert!(map.len() <= map.capacity());
 
-        for i in 0..100 {
-            assert_eq!(unsafe { *map.get_existing(i) }, i);
+            for i in 0..capacity {
+                assert_eq!(unsafe { *map.get_existing((i + 1) as u64) }, i as u32);
+            }
         }
     }
 }
