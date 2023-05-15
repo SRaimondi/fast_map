@@ -482,6 +482,13 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
         }
     }
 
+    /// Create new map from the given iterator of couples.
+    pub fn from_exact_iter(it: impl ExactSizeIterator<Item = (B::Key, V)>) -> Self {
+        let mut map = Self::with_capacity(it.len());
+        it.for_each(|(key, value)| unsafe { map.insert_direct(key, value) });
+        map
+    }
+
     /// Get reference to the value for the given key assuming it exists.
     /// # Safety
     /// The function assumes the key will be found in the map, it's UB to use it with a key that is
@@ -531,6 +538,9 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
 
 #[cfg(test)]
 mod tests {
+    use metrohash::MetroHashSet;
+    use rand::distributions::{Distribution, Uniform};
+
     use super::*;
 
     #[test]
@@ -561,6 +571,32 @@ mod tests {
 
             for i in 0..capacity {
                 assert_eq!(unsafe { *map.get_existing((i + 1) as u64) }, i as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_u32() {
+        const N: usize = 100_000;
+        let mut added = MetroHashSet::default();
+
+        let interval = Uniform::new(0, 3 * N as u32);
+        let mut rng = rand::thread_rng();
+
+        let mut map = FastMap::<U32KeysBlock, u32>::with_capacity(N);
+        while map.len() < N {
+            let i = interval.sample(&mut rng);
+            if !added.contains(&i) {
+                added.insert(i);
+                map.try_insert(i, i).unwrap();
+            }
+        }
+
+        const TESTS: usize = 200_000;
+        for _ in 0..TESTS {
+            let i = interval.sample(&mut rng);
+            if added.contains(&i) {
+                assert_eq!(unsafe { *map.get_existing(i) }, i);
             }
         }
     }
