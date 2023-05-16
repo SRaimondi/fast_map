@@ -50,7 +50,7 @@ fn bench_creation(c: &mut Criterion) {
     }
 }
 
-fn bench_lookup(c: &mut Criterion) {
+fn bench_lookup_existing(c: &mut Criterion) {
     let mut group = c.benchmark_group("MetroHashMap - FastMap lookup existing key");
 
     for size in (5..=22).map(|shift| 1 << shift) {
@@ -95,5 +95,41 @@ fn bench_lookup(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_creation, bench_lookup);
+fn bench_search(c: &mut Criterion) {
+    let mut group = c.benchmark_group("MetroHashMap - FastMap search key");
+
+    for size in (5..=22).map(|shift| 1 << shift) {
+        let interval = Uniform::new(0, 4 * size as u32);
+        let mut rng = rand::thread_rng();
+
+        let indices: Vec<_> = {
+            let mut added = MetroHashSet::default();
+            while added.len() < size {
+                added.insert(interval.sample(&mut rng));
+            }
+
+            added.into_iter().collect()
+        };
+
+        {
+            let mut rng = rand_pcg::Pcg32::seed_from_u64(101);
+            let map: MetroHashMap<_, _> = indices.iter().map(|&i| (i, i)).collect();
+
+            group.bench_with_input(BenchmarkId::new("MetroHashMap", size), &size, |b, _| {
+                b.iter(|| black_box(map.get(&interval.sample(&mut rng))));
+            });
+        }
+
+        {
+            let mut rng = rand_pcg::Pcg32::seed_from_u64(101);
+            let map = MapSIMD::from_exact_iter(indices.iter().map(|&i| (i, i)));
+
+            group.bench_with_input(BenchmarkId::new("FastMap", size), &size, |b, _| {
+                b.iter(|| black_box(map.get(interval.sample(&mut rng))));
+            });
+        }
+    }
+}
+
+criterion_group!(benches, bench_creation, bench_lookup_existing, bench_search);
 criterion_main!(benches);
