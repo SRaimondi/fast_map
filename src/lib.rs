@@ -5,29 +5,53 @@ use std::{
     slice,
 };
 
+/// Helper function to round up the division between a and b.
 #[inline]
 fn round_up(a: usize, b: usize) -> usize {
     assert_ne!(b, 0);
     (a + b - 1) / b
 }
 
-/// Helper function to check if the given key is in the given array when we don't have the
-/// optimised architecture.
-#[inline]
-fn find_in_keys<T: Copy + Eq + std::fmt::Debug, const N: usize>(
-    keys: &[T; N],
-    key: T,
-    free_key: T,
-) -> Option<usize> {
-    for i in 0..N {
-        let k = keys[i];
-        debug_assert_ne!(k, free_key);
-        if k == key {
-            return Some(i);
-        }
+/// Helper struct representing a bitset that we use to indicate what keys are used and what not.
+#[derive(Copy, Clone, Default)]
+#[repr(transparent)]
+struct KeysMask<const IN_USE_BITS: usize> {
+    mask: u32,
+}
+
+impl<const IN_USE_BITS: usize> KeysMask<IN_USE_BITS> {
+    /// Add key to the mask and return the index where it's inserted.
+    #[inline(always)]
+    fn add(&mut self) -> u32 {
+        let index = self.mask.trailing_ones();
+        debug_assert!(index < IN_USE_BITS as u32);
+        self.mask |= 1 << index;
+        index
     }
 
-    None
+    /// Count how many keys are in use.
+    #[inline(always)]
+    fn in_use_keys(self) -> u32 {
+        self.mask.trailing_ones()
+    }
+
+    /// Check if the chunk is full.
+    #[inline(always)]
+    fn is_full(self) -> bool {
+        self.mask == (1 << IN_USE_BITS) - 1
+    }
+
+    /// Check if the block is empty.
+    #[inline(always)]
+    fn is_empty(self) -> bool {
+        self.mask == 0
+    }
+
+    /// Check if there is still space in the chunk.
+    #[inline(always)]
+    fn has_space(self) -> bool {
+        !self.is_full()
+    }
 }
 
 /// Helper function to insert the given key in the keys with the given mask.
@@ -75,54 +99,6 @@ pub trait KeysBlock: Copy + Default {
 
     /// Try to insert the given key in the block, returns the offset if successful.
     fn try_insert(&mut self, key: Self::Key) -> Option<usize>;
-}
-
-/// Helper struct representing a bitset that we use to indicate what keys are used and what not.
-#[derive(Copy, Clone, Default)]
-#[repr(transparent)]
-struct KeysMask<const IN_USE_BITS: usize> {
-    mask: u32,
-}
-
-impl<const IN_USE_BITS: usize> KeysMask<IN_USE_BITS> {
-    /// Set the bit for the given index to 1.
-    #[inline(always)]
-    fn set_in_use(&mut self, index: u32) {
-        debug_assert_eq!((self.mask >> index) & 1, 0);
-        debug_assert!(index < IN_USE_BITS as u32);
-        self.mask |= 1 << index;
-    }
-
-    /// Count how many keys are in use.
-    #[inline(always)]
-    fn in_use_keys(self) -> u32 {
-        self.mask.trailing_ones()
-    }
-
-    /// Check if the chunk is full.
-    #[inline(always)]
-    fn is_full(self) -> bool {
-        self.mask == (1 << IN_USE_BITS) - 1
-    }
-
-    /// Check if the block is empty.
-    #[inline(always)]
-    fn is_empty(self) -> bool {
-        self.mask == 0
-    }
-
-    /// Get the index where there is an emtpy key.
-    #[inline(always)]
-    fn free_slot_index(self) -> u32 {
-        debug_assert!(self.has_space());
-        self.mask.trailing_ones()
-    }
-
-    /// Check if there is still space in the chunk.
-    #[inline(always)]
-    fn has_space(self) -> bool {
-        !self.is_full()
-    }
 }
 
 /// Struct representing a block of keys where we use u32::MAX as flag for empty slots.
@@ -531,6 +507,7 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
         map
     }
 
+    /// Look for the given key in the map, returns Some with a reference to the value if found, otherwise None.
     pub fn get(&self, key: B::Key) -> Option<&V> {
         unsafe {
             let keys_block_end = self.keys_blocks.add(self.allocated_blocks);
