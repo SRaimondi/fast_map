@@ -35,8 +35,8 @@ pub struct FastMap<B: KeysBlock, V: Copy> {
     in_use_elements: usize,
 }
 
-unsafe impl<B: KeysBlock, V: Copy> Send for FastMap<B, V> {}
-unsafe impl<B: KeysBlock, V: Copy> Sync for FastMap<B, V> {}
+unsafe impl<B: KeysBlock, V: Copy + Send> Send for FastMap<B, V> {}
+unsafe impl<B: KeysBlock, V: Copy + Sync> Sync for FastMap<B, V> {}
 
 impl<B: KeysBlock, V: Copy> Drop for FastMap<B, V> {
     fn drop(&mut self) {

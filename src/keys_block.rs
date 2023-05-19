@@ -115,7 +115,7 @@ pub enum KeySearchResult {
 }
 
 /// Trait representing the common behaviour that both blocks should have for the map.
-pub trait KeysBlock: Copy + Default {
+pub trait KeysBlock: Copy + Default + Send + Sync {
     /// Type of the key in the block.
     type Key: Copy;
 
