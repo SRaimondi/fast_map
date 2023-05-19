@@ -129,5 +129,10 @@ fn bench_search(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_creation, bench_lookup_existing, bench_search);
+criterion_group!(
+    benches,
+    bench_creation,
+    //bench_lookup_existing,
+    bench_search
+);
 criterion_main!(benches);
