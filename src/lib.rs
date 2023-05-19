@@ -1,7 +1,6 @@
 use std::{
     alloc::{self, Layout},
-    ptr::{self, NonNull},
-    slice,
+    ptr, slice,
 };
 
 mod keys_block;
@@ -24,7 +23,7 @@ pub enum TryInsertError {
 
 /// A very fast hashmap designed specifically for some use cases.
 pub struct FastMap<B: KeysBlock, V: Copy> {
-    buffer: NonNull<u8>,
+    buffer: *mut u8,
     keys_blocks: *mut B,
     values: *mut V,
     // Number of blocks allocated
@@ -35,18 +34,13 @@ pub struct FastMap<B: KeysBlock, V: Copy> {
     in_use_elements: usize,
 }
 
-unsafe impl<B: KeysBlock, V: Copy + Send> Send for FastMap<B, V> {}
-unsafe impl<B: KeysBlock, V: Copy + Sync> Sync for FastMap<B, V> {}
+unsafe impl<B: KeysBlock, V: Copy> Send for FastMap<B, V> {}
+unsafe impl<B: KeysBlock, V: Copy> Sync for FastMap<B, V> {}
 
 impl<B: KeysBlock, V: Copy> Drop for FastMap<B, V> {
     fn drop(&mut self) {
         if self.allocated_blocks != 0 {
-            unsafe {
-                alloc::dealloc(
-                    self.buffer.as_ptr(),
-                    Self::buffer_layout(self.allocated_blocks).0,
-                )
-            }
+            unsafe { alloc::dealloc(self.buffer, Self::buffer_layout(self.allocated_blocks).0) }
         }
     }
 }
@@ -54,7 +48,7 @@ impl<B: KeysBlock, V: Copy> Drop for FastMap<B, V> {
 impl<B: KeysBlock, V: Copy> Default for FastMap<B, V> {
     fn default() -> Self {
         Self {
-            buffer: NonNull::dangling(),
+            buffer: ptr::null_mut(),
             keys_blocks: ptr::null_mut(),
             values: ptr::null_mut(),
             allocated_blocks: 0,
@@ -199,16 +193,16 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
             let (buffer_layout, kb_size) = Self::buffer_layout(total_blocks);
 
             unsafe {
-                let buffer = match NonNull::new(alloc::alloc(buffer_layout)) {
-                    Some(b) => b,
-                    None => alloc::handle_alloc_error(buffer_layout),
-                };
+                let buffer = alloc::alloc(buffer_layout);
+                if buffer.is_null() {
+                    alloc::handle_alloc_error(buffer_layout);
+                }
 
-                let keys_blocks = buffer.as_ptr() as *mut B;
+                let keys_blocks = buffer as *mut B;
                 // Set all the blocks to empty
                 slice::from_raw_parts_mut(keys_blocks, total_blocks).fill(B::default());
 
-                let values = buffer.as_ptr().add(kb_size) as *mut V;
+                let values = buffer.add(kb_size) as *mut V;
 
                 Self {
                     buffer,
