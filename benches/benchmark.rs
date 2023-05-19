@@ -7,9 +7,7 @@ use rand::{
     SeedableRng,
 };
 
-use fast_map::{FastMap, U32KeysBlock};
-
-type MapSIMD = FastMap<U32KeysBlock, u32>;
+use fast_map::FastMapU32;
 
 fn bench_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("MetroHashMap - FastMap creation");
@@ -39,7 +37,7 @@ fn bench_creation(c: &mut Criterion) {
         {
             group.bench_with_input(BenchmarkId::new("FastMap", size), &size, |b, _| {
                 b.iter(|| {
-                    let mut map = MapSIMD::with_capacity(size);
+                    let mut map = FastMapU32::with_capacity(size);
                     indices
                         .iter()
                         .for_each(|&i| unsafe { map.insert_direct(i, i) });
@@ -81,7 +79,7 @@ fn bench_lookup_existing(c: &mut Criterion) {
         }
 
         {
-            let mut map = MapSIMD::with_capacity(size);
+            let mut map = FastMapU32::with_capacity(size);
             indices.iter().for_each(|&i| map.try_insert(i, i).unwrap());
 
             group.bench_with_input(BenchmarkId::new("FastMap", size), &size, |b, _| {
@@ -122,7 +120,7 @@ fn bench_search(c: &mut Criterion) {
 
         {
             let mut rng = rand_pcg::Pcg32::seed_from_u64(101);
-            let map = MapSIMD::from_exact_iter(indices.iter().map(|&i| (i, i)));
+            let map = FastMapU32::from_exact_iter(indices.iter().map(|&i| (i, i)));
 
             group.bench_with_input(BenchmarkId::new("FastMap", size), &size, |b, _| {
                 b.iter(|| black_box(map.get(interval.sample(&mut rng))));
