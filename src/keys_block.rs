@@ -159,6 +159,9 @@ macro_rules! impl_block {
 
             #[inline(always)]
             fn try_insert(&mut self, key: Self::Key) -> Option<u32> {
+                debug_assert!(
+                    (0..self.keys_mask.total_keys()).all(|i| self.keys[i as usize] != key)
+                );
                 self.keys_mask.add_key().map(|offset| unsafe {
                     *self.keys.get_unchecked_mut(offset as usize) = key;
                     offset
