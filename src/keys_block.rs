@@ -130,6 +130,12 @@ pub trait KeysBlock: Copy + Default {
 
     /// Try to insert a key in the block, returns None if the block is full or the insertion offset.
     fn try_insert(&mut self, key: Self::Key) -> Option<u32>;
+
+    /// Get the total number of keys in the block.
+    fn total_keys(&self) -> u32;
+
+    /// Get the key at the given offset.
+    fn get_key(&self, offset: u32) -> Self::Key;
 }
 
 macro_rules! impl_block {
@@ -186,6 +192,16 @@ macro_rules! impl_block {
                     self.keys.get_unchecked_mut(offset as usize).write(key);
                     offset
                 })
+            }
+
+            #[inline(always)]
+            fn total_keys(&self) -> u32 {
+                self.keys_mask.total_keys()
+            }
+
+            #[inline(always)]
+            fn get_key(&self, offset: u32) -> Self::Key {
+                unsafe { self.keys.get_unchecked(offset as usize).assume_init_read() }
             }
         }
     };

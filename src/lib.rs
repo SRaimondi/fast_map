@@ -284,6 +284,27 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
         }
     }
 
+    /// Execute the given function on each element of the map.
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(B::Key, V),
+    {
+        unsafe {
+            let mut values_offset = 0;
+            slice::from_raw_parts(self.keys_blocks, self.allocated_blocks)
+                .iter()
+                .for_each(|block| {
+                    for key_index in 0..block.total_keys() {
+                        f(
+                            block.get_key(key_index),
+                            self.values.add(values_offset + key_index as usize).read(),
+                        );
+                    }
+                    values_offset += B::KEYS_PER_BLOCK;
+                });
+        }
+    }
+
     /// Return the capacity of the map, the number of elements that can be added before resizing.
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -401,5 +422,15 @@ mod tests {
                 assert!(map.get(i as u64).is_none());
             }
         }
+    }
+
+    #[test]
+    fn test_for_each() {
+        let mut map = FastMapU32::with_capacity(100);
+        for i in 0..100 {
+            map.try_insert(i, i).unwrap();
+        }
+
+        map.for_each(|key, value| assert_eq!(key, value));
     }
 }
