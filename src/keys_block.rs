@@ -1,13 +1,23 @@
 use crate::keys_mask::{U32KeysMask, U64KeysMask};
 
-use std::num::NonZeroU32;
+use std::{mem::MaybeUninit, num::NonZeroU32};
 
 /// Struct storing a block of u32 keys.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone)]
 #[cfg_attr(target_arch = "x86_64", repr(align(128), C))]
 pub struct U32KeysBlock {
     keys_mask: U32KeysMask,
-    keys: [u32; U32KeysMask::IN_USE_BITS as usize],
+    keys: [MaybeUninit<u32>; U32KeysMask::IN_USE_BITS as usize],
+}
+
+impl Default for U32KeysBlock {
+    #[inline(always)]
+    fn default() -> Self {
+        Self {
+            keys_mask: U32KeysMask::default(),
+            keys: [MaybeUninit::uninit(); U32KeysMask::IN_USE_BITS as usize],
+        }
+    }
 }
 
 impl U32KeysBlock {
@@ -44,12 +54,23 @@ impl U32KeysBlock {
 }
 
 /// Struct storing a block of u64 keys.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone)]
 #[cfg_attr(target_arch = "x86_64", repr(align(128), C))]
 pub struct U64KeysBlock {
     keys_mask: U64KeysMask,
     _padding: u32,
-    keys: [u64; U64KeysMask::IN_USE_BITS as usize],
+    keys: [MaybeUninit<u64>; U64KeysMask::IN_USE_BITS as usize],
+}
+
+impl Default for U64KeysBlock {
+    #[inline(always)]
+    fn default() -> Self {
+        Self {
+            keys_mask: U64KeysMask::default(),
+            _padding: 0,
+            keys: [MaybeUninit::uninit(); U64KeysMask::IN_USE_BITS as usize],
+        }
+    }
 }
 
 impl U64KeysBlock {
@@ -159,11 +180,10 @@ macro_rules! impl_block {
 
             #[inline(always)]
             fn try_insert(&mut self, key: Self::Key) -> Option<u32> {
-                debug_assert!(
-                    (0..self.keys_mask.total_keys()).all(|i| self.keys[i as usize] != key)
-                );
+                debug_assert!((0..self.keys_mask.total_keys())
+                    .all(|i| unsafe { self.keys[i as usize].assume_init_read() } != key));
                 self.keys_mask.add_key().map(|offset| unsafe {
-                    *self.keys.get_unchecked_mut(offset as usize) = key;
+                    self.keys.get_unchecked_mut(offset as usize).write(key);
                     offset
                 })
             }
