@@ -156,27 +156,6 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
         }
     }
 
-    /// Directly insert the key and index couple in the map without checking if we need to resize.
-    /// # Safety
-    /// This function assumes that you know there is enough space to do the insertion.
-    /// Panics in debug if that's not the case.
-    pub unsafe fn insert_direct(&mut self, key: B::Key, value: V) {
-        self.insert_internal(key, value);
-    }
-
-    /// Try to insert a new element without resizing the map. Returns Ok if the element can be inserted,
-    /// Err if we are out of space.
-    pub fn try_insert(&mut self, key: B::Key, value: V) -> Result<(), TryInsertError> {
-        // Check if we are out of space on the map to insert further indices
-        if self.capacity() > self.len() {
-            // SAFETY: We just checked there is enough space
-            unsafe { self.insert_direct(key, value) };
-            Ok(())
-        } else {
-            Err(TryInsertError::OutOfSpace)
-        }
-    }
-
     /// Create new map with at least the required capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity == 0 {
@@ -221,6 +200,27 @@ impl<B: KeysBlock, V: Copy> FastMap<B, V> {
         let mut map = Self::with_capacity(it.len());
         it.for_each(|(key, value)| unsafe { map.insert_direct(key, value) });
         map
+    }
+
+    /// Directly insert the key and index couple in the map without checking if we need to resize.
+    /// # Safety
+    /// This function assumes that you know there is enough space to do the insertion.
+    /// Panics in debug if that's not the case.
+    pub unsafe fn insert_direct(&mut self, key: B::Key, value: V) {
+        self.insert_internal(key, value);
+    }
+
+    /// Try to insert a new element without resizing the map. Returns Ok if the element can be inserted,
+    /// Err if we are out of space.
+    pub fn try_insert(&mut self, key: B::Key, value: V) -> Result<(), TryInsertError> {
+        // Check if we are out of space on the map to insert further indices
+        if self.capacity() > self.len() {
+            // SAFETY: We just checked there is enough space
+            unsafe { self.insert_direct(key, value) };
+            Ok(())
+        } else {
+            Err(TryInsertError::OutOfSpace)
+        }
     }
 
     /// Look for the given key in the map, returns Some with a reference to the value if found, otherwise None.
